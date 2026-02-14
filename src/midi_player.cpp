@@ -1,15 +1,21 @@
-
+/*
+ * ESP32 DevKit V1 4-Channel MIDI Player with DAC Output
+ * Plays Super Mario Bros Overworld Theme
+ * Outputs to GPIO25 (DAC1) or GPIO26 (DAC2)
+ */
 
 #include <Arduino.h>
 #include "FS.h"
 #include "LittleFS.h"
 #include <WiFi.h>
+#include <driver/dac.h>
 
-// GPIO Pin for audio output
-#define BUZZER_PIN 2
+// GPIO Pin for audio output - ESP32 DevKit V1 DAC pins
+#define DAC_CHANNEL DAC_CHANNEL_1  // GPIO25 (DAC1) or use DAC_CHANNEL_2 for GPIO26
+#define DAC_GPIO 25  // GPIO25 for DAC1, or 26 for DAC2
 
 // MIDI Parser Constants
-#define MAX_EVENTS 1000
+#define MAX_EVENTS 1000  // Reduced for DevKit V1 limited RAM
 
 // MIDI Event Types
 #define MIDI_NOTE_OFF 0x80
@@ -21,9 +27,6 @@
 
 // Audio generation
 #define SAMPLE_RATE 16000
-#define PWM_FREQUENCY 40000
-#define PWM_CHANNEL 0
-#define PWM_RESOLUTION 8
 
 // Note frequency table in PROGMEM (only commonly used range)
 const float PROGMEM noteFreqTable[] = {
@@ -76,7 +79,7 @@ Track *tracks = nullptr;
 uint8_t trackCount = 0;
 uint16_t ticksPerQuarter = 480;
 uint32_t microsecondsPerQuarter = 500000; // Default 120 BPM
-ActiveNote DRAM_ATTR activeNotes[4]; // 4 channels - ensure in DRAM not PSRAM
+ActiveNote DRAM_ATTR activeNotes[4]; // 4 channels for polyphony
 uint32_t currentTick = 0;
 
 // Audio generation - no hardware timer needed
@@ -138,16 +141,21 @@ bool parseMIDI(const char* filename) {
   // Allocate for actual number of tracks
   trackCount = numTracks;
   
-  // Allocate tracks in PSRAM
+  // Allocate tracks in heap memory
   if (tracks != nullptr) {
     free(tracks);
   }
-  tracks = (Track*)ps_malloc(sizeof(Track) * trackCount);
+  tracks = (Track*)malloc(sizeof(Track) * trackCount);
   if (tracks == nullptr) {
     Serial.println("Failed to allocate memory for tracks");
     file.close();
     return false;
   }
+  
+  Serial.printf("Allocated %d bytes for %d tracks\n", sizeof(Track) * trackCount, trackCount);
+
+  // Remaining memory
+  Serial.printf("Free heap after track allocation: %d bytes\n", ESP.getFreeHeap());
   
   // Initialize all tracks
   for (int t = 0; t < trackCount; t++) {
@@ -299,8 +307,9 @@ portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 
 volatile uint8_t currentSample = 128;
 
+// DAC output function called by timer interrupt
 void IRAM_ATTR onAudioTimer() {
-  ledcWrite(PWM_CHANNEL, currentSample);
+  dac_output_voltage(DAC_CHANNEL, currentSample);
 }
 
 // Process MIDI events for current tick
@@ -363,7 +372,7 @@ void setup() {
   WiFi.mode(WIFI_OFF);
   btStop();
 
-    Serial.println("ESP32 CAM MIDI Player Starting...");
+  Serial.println("ESP32 DevKit V1 MIDI Player with DAC Starting...");
   
   // Initialize LittleFS
   if (!LittleFS.begin(true)) {
@@ -372,15 +381,15 @@ void setup() {
   }
   Serial.println("LittleFS Mounted");
   
-  // Setup PWM for audio output
-  ledcSetup(PWM_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
-  ledcAttachPin(BUZZER_PIN, PWM_CHANNEL);
-  ledcWrite(PWM_CHANNEL, 128); // Center position
+  // Initialize DAC
+  dac_output_enable(DAC_CHANNEL);
+  dac_output_voltage(DAC_CHANNEL, 128); // Set to middle value (0V relative to 0-3.3V range)
+  Serial.printf("DAC initialized on GPIO%d\n", DAC_GPIO);
 
-  // THEN start timer
-  audioTimer = timerBegin(0, 80, true);
+  // Setup timer for audio sample generation (16kHz = 62.5us per sample)
+  audioTimer = timerBegin(0, 80, true);  // 80MHz / 80 = 1MHz (1us per tick)
   timerAttachInterrupt(audioTimer, &onAudioTimer, true);
-  timerAlarmWrite(audioTimer, 62, true);
+  timerAlarmWrite(audioTimer, 62, true);  // 62us = ~16kHz sample rate
   timerAlarmEnable(audioTimer);
   
   // Initialize active notes
@@ -403,13 +412,9 @@ void setup() {
   Serial.println("MIDI parsed successfully!");
   Serial.printf("Track count: %d\n", trackCount);
   Serial.printf("Free heap: %d\n", ESP.getFreeHeap());
-  Serial.printf("Free PSRAM: %d\n", ESP.getFreePsram());
   
   // Wait a bit before starting playback
   delay(500);
-  
-  // Create audio generation task on core 0 with high priority
-  Serial.println("Creating audio task...");
   
   Serial.println("Starting playback...");
 
