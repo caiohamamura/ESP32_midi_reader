@@ -1,6 +1,6 @@
 /*
- * ESP32 DevKit V1 4-Channel MIDI Player with DAC Output
- * Plays Super Mario Bros Overworld Theme
+ * ESP32 DevKit V1 18-Channel MIDI Player with DAC Output
+ * Static allocation version with per-track event limiting
  * Outputs to GPIO25 (DAC1) or GPIO26 (DAC2)
  */
 
@@ -14,8 +14,11 @@
 #define DAC_CHANNEL DAC_CHANNEL_1  // GPIO25 (DAC1) or use DAC_CHANNEL_2 for GPIO26
 #define DAC_GPIO 25  // GPIO25 for DAC1, or 26 for DAC2
 
-// MIDI Parser Constants
-#define MAX_EVENTS 1000  // Reduced for DevKit V1 limited RAM
+// Configuration - Adjust these based on available memory
+#define MAX_TRACKS 18           // Maximum number of tracks to support
+#define MAX_POLYPHONY 18        // Maximum simultaneous notes
+#define MAX_EVENTS_PER_TRACK 800 // Events per track (static allocation)
+#define TOTAL_EVENT_POOL 6000   // Total events across ALL tracks
 
 // MIDI Event Types
 #define MIDI_NOTE_OFF 0x80
@@ -48,7 +51,7 @@ float IRAM_ATTR getNoteFrequency(uint8_t note) {
   return pgm_read_float(&noteFreqTable[note - 21]);
 }
 
-// MIDI Event structure
+// MIDI Event structure (16 bytes)
 struct MIDIEvent {
   uint32_t deltaTime;
   uint32_t absoluteTime;
@@ -58,32 +61,40 @@ struct MIDIEvent {
   uint8_t velocity;
 };
 
-// Track structure
+// Track structure - points into shared event pool
 struct Track {
-  MIDIEvent events[MAX_EVENTS];
-  uint16_t eventCount;
-  uint16_t currentEvent;
+  uint16_t eventStart;      // Starting index in global event pool
+  uint16_t eventCount;      // Number of events
+  uint16_t currentEvent;    // Current playback position
+  bool active;              // Is this track being used?
 };
 
 // Active note structure for polyphony
 struct ActiveNote {
   uint8_t note;
   uint8_t channel;
+  uint8_t instrument;  // MIDI program number
   float frequency;
   uint8_t velocity;
   bool active;
 };
 
-// Global variables
-Track *tracks = nullptr;
+// Global variables - static allocation
+Track tracks[MAX_TRACKS];
+MIDIEvent eventPool[TOTAL_EVENT_POOL];  // Shared pool of events
+uint16_t nextEventIndex = 0;            // Next free slot in event pool
+
+uint8_t channelInstruments[16] = {0};   // Track instrument per MIDI channel (0-15)
+
 uint8_t trackCount = 0;
+uint8_t polyphonyCount = MAX_POLYPHONY;
 uint16_t ticksPerQuarter = 480;
 uint32_t microsecondsPerQuarter = 500000; // Default 120 BPM
-ActiveNote DRAM_ATTR activeNotes[4]; // 4 channels for polyphony
+ActiveNote DRAM_ATTR activeNotes[MAX_POLYPHONY];
 uint32_t currentTick = 0;
 
-// Audio generation - no hardware timer needed
-volatile float DRAM_ATTR phase[4] = {0, 0, 0, 0};
+// Audio generation
+volatile float DRAM_ATTR phase[MAX_POLYPHONY];
 
 // Read variable length quantity from MIDI file
 uint32_t readVarLen(File &file) {
@@ -138,33 +149,28 @@ bool parseMIDI(const char* filename) {
   
   Serial.printf("MIDI Format: %d, Tracks: %d, TPQ: %d\n", format, numTracks, ticksPerQuarter);
   
-  // Allocate for actual number of tracks
-  trackCount = numTracks;
-  
-  // Allocate tracks in heap memory
-  if (tracks != nullptr) {
-    free(tracks);
-  }
-  tracks = (Track*)malloc(sizeof(Track) * trackCount);
-  if (tracks == nullptr) {
-    Serial.println("Failed to allocate memory for tracks");
-    file.close();
-    return false;
+  // Limit to MAX_TRACKS
+  trackCount = min(numTracks, (uint16_t)MAX_TRACKS);
+  if (numTracks > MAX_TRACKS) {
+    Serial.printf("Warning: MIDI has %d tracks, limiting to %d\n", numTracks, MAX_TRACKS);
   }
   
-  Serial.printf("Allocated %d bytes for %d tracks\n", sizeof(Track) * trackCount, trackCount);
-
-  // Remaining memory
-  Serial.printf("Free heap after track allocation: %d bytes\n", ESP.getFreeHeap());
+  // Reset event pool
+  nextEventIndex = 0;
   
   // Initialize all tracks
-  for (int t = 0; t < trackCount; t++) {
+  for (int t = 0; t < MAX_TRACKS; t++) {
+    tracks[t].eventStart = 0;
     tracks[t].eventCount = 0;
     tracks[t].currentEvent = 0;
+    tracks[t].active = false;
   }
   
+  Serial.printf("Event pool capacity: %d events (%d bytes)\n", 
+                TOTAL_EVENT_POOL, TOTAL_EVENT_POOL * sizeof(MIDIEvent));
+  
   // Parse each track
-  for (int t = 0; t < trackCount; t++) {
+  for (int t = 0; t < numTracks; t++) {
     // Check if we have enough data
     if (file.available() < 8) {
       Serial.printf("Not enough data for track %d\n", t);
@@ -201,10 +207,22 @@ bool parseMIDI(const char* filename) {
     uint32_t trackLength = read32BE(file);
     uint32_t trackEnd = file.position() + trackLength;
     
-    Serial.printf("Track %d length: %d bytes\n", t, trackLength);
+    Serial.printf("Track %d length: %d bytes", t, trackLength);
     
     uint32_t absoluteTime = 0;
     uint8_t runningStatus = 0;
+    
+    // Only parse events if this track is within our limit
+    bool shouldParse = (t < trackCount);
+    
+    // Mark starting point in event pool
+    if (shouldParse) {
+      tracks[t].eventStart = nextEventIndex;
+      tracks[t].active = true;
+    }
+    
+    uint16_t trackEventCount = 0;
+    uint16_t skippedEvents = 0;
     
     while (file.position() < trackEnd && file.available() > 0) {
       uint32_t deltaTime = readVarLen(file);
@@ -236,26 +254,38 @@ bool parseMIDI(const char* filename) {
           type = MIDI_NOTE_OFF;
         }
         
-        // Only store if we have space
-        if (tracks[t].eventCount < MAX_EVENTS) {
-          MIDIEvent &evt = tracks[t].events[tracks[t].eventCount];
-          evt.deltaTime = deltaTime;
-          evt.absoluteTime = absoluteTime;
-          evt.type = type;
-          evt.channel = channel;
-          evt.note = note;
-          evt.velocity = velocity;
-          tracks[t].eventCount++;
+        // Store if we're parsing this track and have space
+        bool canStore = shouldParse && 
+                       nextEventIndex < TOTAL_EVENT_POOL &&
+                       trackEventCount < MAX_EVENTS_PER_TRACK;
+        
+        if (canStore) {
+          eventPool[nextEventIndex].deltaTime = deltaTime;
+          eventPool[nextEventIndex].absoluteTime = absoluteTime;
+          eventPool[nextEventIndex].type = type;
+          eventPool[nextEventIndex].channel = channel;
+          eventPool[nextEventIndex].note = note;
+          eventPool[nextEventIndex].velocity = velocity;
+          nextEventIndex++;
+          trackEventCount++;
+        } else if (shouldParse) {
+          skippedEvents++;
         }
         
       } else if (type == MIDI_PROGRAM_CHANGE) {
         if (file.available() < 1) break;
         uint8_t program = file.read();
-        // Ignore program changes for buzzer
+        
+        // Track instrument change for this channel
+        channelInstruments[channel] = program;
+        
+        if (shouldParse) {
+          Serial.printf("\n  Ch%d: Program %d", channel, program);
+        }
       } else if (type == 0xB0) { // Control Change
         if (file.available() < 2) break;
-        file.read(); // controller
-        file.read(); // value
+        file.read();
+        file.read();
       } else if (type == 0xE0) { // Pitch Bend
         if (file.available() < 2) break;
         file.read();
@@ -275,7 +305,7 @@ bool parseMIDI(const char* filename) {
         
         if (metaType == MIDI_SET_TEMPO && metaLength == 3 && file.available() >= 3) {
           microsecondsPerQuarter = (file.read() << 16) | (file.read() << 8) | file.read();
-          Serial.printf("Tempo: %d us/quarter\n", microsecondsPerQuarter);
+          Serial.printf("\nTempo: %d us/quarter\n", microsecondsPerQuarter);
         } else {
           // Skip other meta events
           for (uint32_t i = 0; i < metaLength && file.available() > 0; i++) {
@@ -295,8 +325,22 @@ bool parseMIDI(const char* filename) {
       file.seek(trackEnd);
     }
     
-    Serial.printf("Track %d: %d events\n", t, tracks[t].eventCount);
+    if (shouldParse) {
+      tracks[t].eventCount = trackEventCount;
+      Serial.printf(" → %d events", trackEventCount);
+      if (skippedEvents > 0) {
+        Serial.printf(" (skipped %d)", skippedEvents);
+      }
+      Serial.println();
+    } else {
+      Serial.println(" (not parsed)");
+    }
   }
+  
+  Serial.printf("\nTotal events loaded: %d / %d (%.1f%% full)\n", 
+                nextEventIndex, TOTAL_EVENT_POOL, 
+                (nextEventIndex * 100.0) / TOTAL_EVENT_POOL);
+  Serial.printf("Memory used: %d bytes for events\n", nextEventIndex * sizeof(MIDIEvent));
   
   file.close();
   return true;
@@ -314,13 +358,14 @@ void IRAM_ATTR onAudioTimer() {
 
 // Process MIDI events for current tick
 void processTick() {
-  if (tracks == nullptr) return;
-  
   for (int t = 0; t < trackCount; t++) {
+    if (!tracks[t].active) continue;
+    
     Track &track = tracks[t];
     
     while (track.currentEvent < track.eventCount) {
-      MIDIEvent &evt = track.events[track.currentEvent];
+      uint16_t eventIndex = track.eventStart + track.currentEvent;
+      MIDIEvent &evt = eventPool[eventIndex];
       
       if (evt.absoluteTime > currentTick) {
         break;
@@ -329,7 +374,7 @@ void processTick() {
       if (evt.type == MIDI_NOTE_ON) {
         // Find free slot or same note
         int slot = -1;
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < polyphonyCount; i++) {
           if (!activeNotes[i].active || 
               (activeNotes[i].note == evt.note && activeNotes[i].channel == evt.channel)) {
             slot = i;
@@ -337,9 +382,15 @@ void processTick() {
           }
         }
         
+        // If no free slot, steal oldest (first in array)
+        if (slot < 0) {
+          slot = 0;
+        }
+        
         if (slot >= 0) {
           activeNotes[slot].note = evt.note;
           activeNotes[slot].channel = evt.channel;
+          activeNotes[slot].instrument = channelInstruments[evt.channel];
           activeNotes[slot].frequency = getNoteFrequency(evt.note);
           activeNotes[slot].velocity = evt.velocity;
           activeNotes[slot].active = true;
@@ -348,7 +399,7 @@ void processTick() {
         
       } else if (evt.type == MIDI_NOTE_OFF) {
         // Stop the note
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < polyphonyCount; i++) {
           if (activeNotes[i].active && 
               activeNotes[i].note == evt.note && 
               activeNotes[i].channel == evt.channel) {
@@ -372,7 +423,14 @@ void setup() {
   WiFi.mode(WIFI_OFF);
   btStop();
 
-  Serial.println("ESP32 DevKit V1 MIDI Player with DAC Starting...");
+  Serial.println("ESP32 DevKit V1 18-Track MIDI Player Starting...");
+  Serial.printf("Configuration:\n");
+  Serial.printf("  MAX_TRACKS: %d\n", MAX_TRACKS);
+  Serial.printf("  MAX_POLYPHONY: %d voices\n", MAX_POLYPHONY);
+  Serial.printf("  MAX_EVENTS_PER_TRACK: %d\n", MAX_EVENTS_PER_TRACK);
+  Serial.printf("  TOTAL_EVENT_POOL: %d events\n", TOTAL_EVENT_POOL);
+  Serial.printf("  Memory for events: %d bytes\n", TOTAL_EVENT_POOL * sizeof(MIDIEvent));
+  Serial.printf("  Initial free heap: %d bytes\n\n", ESP.getFreeHeap());
   
   // Initialize LittleFS
   if (!LittleFS.begin(true)) {
@@ -383,80 +441,169 @@ void setup() {
   
   // Initialize DAC
   dac_output_enable(DAC_CHANNEL);
-  dac_output_voltage(DAC_CHANNEL, 128); // Set to middle value (0V relative to 0-3.3V range)
+  dac_output_voltage(DAC_CHANNEL, 128);
   Serial.printf("DAC initialized on GPIO%d\n", DAC_GPIO);
 
-  // Setup timer for audio sample generation (16kHz = 62.5us per sample)
-  audioTimer = timerBegin(0, 80, true);  // 80MHz / 80 = 1MHz (1us per tick)
+  // Setup timer for audio sample generation (16kHz)
+  audioTimer = timerBegin(0, 80, true);
   timerAttachInterrupt(audioTimer, &onAudioTimer, true);
-  timerAlarmWrite(audioTimer, 62, true);  // 62us = ~16kHz sample rate
+  timerAlarmWrite(audioTimer, 62, true);
   timerAlarmEnable(audioTimer);
   
   // Initialize active notes
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < MAX_POLYPHONY; i++) {
     activeNotes[i].active = false;
     activeNotes[i].frequency = 0;
     activeNotes[i].velocity = 0;
     activeNotes[i].note = 0;
     activeNotes[i].channel = 0;
+    activeNotes[i].instrument = 0;
+    phase[i] = 0;
   }
+  
+  // Initialize channel instruments (default to Acoustic Grand Piano)
+  for (int i = 0; i < 16; i++) {
+    channelInstruments[i] = 0;
+  }
+  channelInstruments[9] = 128; // Channel 10 (index 9) is percussion
   
   Serial.println("Active notes initialized");
   
   // Parse MIDI file
+  Serial.println("\nParsing MIDI file...");
   if (!parseMIDI("/data/overworld.mid")) {
     Serial.println("Failed to parse MIDI file");
     return;
   }
   
-  Serial.println("MIDI parsed successfully!");
-  Serial.printf("Track count: %d\n", trackCount);
-  Serial.printf("Free heap: %d\n", ESP.getFreeHeap());
+  Serial.println("\nMIDI parsed successfully!");
+  Serial.printf("Active tracks: %d\n", trackCount);
+  Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
   
-  // Wait a bit before starting playback
+  // Wait before starting playback
   delay(500);
   
-  Serial.println("Starting playback...");
+  Serial.println("\nStarting playback...\n");
 
   uint32_t start = micros();
   lastSample = start;
   lastTickTime = start;
 }
 
-
-
 void generateSample() {
   int16_t sample = 0;
 
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < polyphonyCount; i++) {
     if (activeNotes[i].active) {
 
       if (activeNotes[i].channel == 9) {
+        // Percussion channel - use noise
         int noiseVal = (random(256) - 128);
         sample += (noiseVal * activeNotes[i].velocity) >> 9;
       } else {
+        // Melodic channel - select waveform based on instrument
         float freq = activeNotes[i].frequency;
         float increment = freq / SAMPLE_RATE;
+        uint8_t instrument = activeNotes[i].instrument;
 
         phase[i] += increment;
         if (phase[i] >= 1.0f) phase[i] -= 1.0f;
 
-        int16_t wave = (phase[i] < 0.5f) ? 127 : -128;
+        int16_t wave = 0;
+        
+        // Different waveforms for different instrument families
+        // Piano (0-7): Bright square wave
+        if (instrument <= 7) {
+          wave = (phase[i] < 0.5f) ? 127 : -128;
+        }
+        // Chromatic Percussion (8-15): Triangle wave
+        else if (instrument <= 15) {
+          wave = (phase[i] < 0.5f) ? (phase[i] * 512 - 128) : (384 - phase[i] * 512);
+        }
+        // Organ (16-23): Square wave with harmonics
+        else if (instrument <= 23) {
+          wave = (phase[i] < 0.5f) ? 127 : -128;
+          // Add some 2nd harmonic
+          float phase2 = fmod(phase[i] * 2.0f, 1.0f);
+          wave += ((phase2 < 0.5f) ? 32 : -32);
+        }
+        // Guitar (24-31): Sawtooth
+        else if (instrument <= 31) {
+          // Calculate time since note started (in samples)
+          float timeSinceStart = phase[i] * (SAMPLE_RATE / freq);
+          
+          // Exponential decay envelope (fast attack, slow decay)
+          float envelope = exp(-timeSinceStart * 0.003f); 
+          
+          wave = ((phase[i] * 255) - 128) * envelope;
+        }
+        // Bass (32-39): Deep square wave
+        else if (instrument <= 39) {
+          wave = (phase[i] < 0.5f) ? 100 : -100;
+        }
+        // Strings (40-47): Soft triangle
+        else if (instrument <= 47) {
+          wave = (phase[i] < 0.5f) ? (phase[i] * 384 - 96) : (288 - phase[i] * 384);
+        }
+        // Ensemble (48-55): Triangle with vibrato
+        else if (instrument <= 55) {
+          wave = (phase[i] < 0.5f) ? (phase[i] * 448 - 112) : (336 - phase[i] * 448);
+        }
+        // Brass (56-63): Rich square
+        else if (instrument <= 63) {
+          wave = (phase[i] < 0.4f) ? 127 : -128;
+        }
+        // Reed/Woodwinds (64-79): Clarinet uses hollow square wave
+        else if (instrument <= 79) {
+          // Hollow square wave (like clarinet - odd harmonics only)
+          wave = (phase[i] < 0.3f || (phase[i] > 0.5f && phase[i] < 0.8f)) ? 90 : -90;
+        }
+        // Pipe (80-87): Sine-like (approximated with multi-step)
+        else if (instrument <= 87) {
+          if (phase[i] < 0.25f) wave = phase[i] * 512;
+          else if (phase[i] < 0.75f) wave = 128 - (phase[i] - 0.25f) * 512;
+          else wave = -128 + (phase[i] - 0.75f) * 512;
+        }
+        // Synth Lead (80-95): Sawtooth
+        else if (instrument <= 95) {
+          wave = (phase[i] * 255) - 128;
+        }
+        // Synth Pad (96-103): Soft triangle
+        else if (instrument <= 103) {
+          wave = (phase[i] < 0.5f) ? (phase[i] * 320 - 80) : (240 - phase[i] * 320);
+        }
+        // Synth Effects (104-111): Modulated square
+        else if (instrument <= 111) {
+          float mod = sin(phase[i] * 6.28318f) * 0.3f;
+          wave = ((phase[i] + mod) < 0.5f) ? 110 : -110;
+        }
+        // Ethnic (112-119): Variable square
+        else if (instrument <= 119) {
+          wave = (phase[i] < 0.4f) ? 100 : -100;
+        }
+        // Percussive (120-127): Damped square
+        else {
+          wave = (phase[i] < 0.5f) ? 80 : -80;
+        }
+        
         sample += (wave * activeNotes[i].velocity) >> 7;
       }
     }
   }
 
-  sample >>= 2;
+  // Adjust mixing based on polyphony count
+  int shift = 2;
+  if (polyphonyCount > 8) shift = 3;
+  if (polyphonyCount > 12) shift = 4;
+  
+  sample >>= shift;
   if (sample > 127) sample = 127;
   if (sample < -128) sample = -128;
 
   currentSample = sample + 128;
-  
 }
 
 void restartPlayback() {
-
   currentTick = 0;
 
   // Reset track positions
@@ -465,27 +612,24 @@ void restartPlayback() {
   }
 
   // Stop all active notes
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < polyphonyCount; i++) {
     activeNotes[i].active = false;
     phase[i] = 0;
   }
+  
+  Serial.println("♪ Looping...");
 }
 
-
 void loop() {
-
-  if (tracks == nullptr) return;
-
-
   uint32_t now = micros();
 
-  // ---- Generate ALL missed samples ----
+  // Generate all missed samples
   while ((now - lastSample) >= 62) {
     lastSample += 62;
     generateSample();
   }
 
-  // ---- Process MIDI ticks ----
+  // Process MIDI ticks
   uint32_t usPerTick = microsecondsPerQuarter / ticksPerQuarter;
 
   while ((now - lastTickTime) >= usPerTick) {
@@ -494,11 +638,11 @@ void loop() {
     currentTick++;
   }
 
-  // ---- Loop detection ----
+  // Loop detection
   bool allFinished = true;
 
   for (int t = 0; t < trackCount; t++) {
-    if (tracks[t].currentEvent < tracks[t].eventCount) {
+    if (tracks[t].active && tracks[t].currentEvent < tracks[t].eventCount) {
       allFinished = false;
       break;
     }
